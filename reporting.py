@@ -1,7 +1,9 @@
-"""Excel report builder for LinkScope V1."""
+"""Excel report builder for LinkScope V2."""
 from __future__ import annotations
 
 import io
+from zipfile import ZipFile
+from xml.etree import ElementTree as ET
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -26,7 +28,7 @@ def safe_cell(value):
         return value
     text = str(value)
     # Imported page text is untrusted. Prevent spreadsheet formula injection.
-    if text.startswith(('=', '+', '-', '@', '\t', '\r')):
+    if text.lstrip().startswith(('=', '+', '-', '@', '\t', '\r')):
         return "'" + text
     return text
 
@@ -45,7 +47,7 @@ def add_tab(wb, title: str, df: pd.DataFrame, widths: dict[str, int] | None = No
         for cidx, value in enumerate(row, 1):
             cell = ws.cell(row=ridx, column=cidx, value=safe_cell(value))
             cell.font = Font(name='Aptos', size=10, color='202C3B')
-            cell.alignment = Alignment(vertical='top', wrap_text=(headers[cidx - 1] in ('Existing anchor','Evidence / existing sentence','Reason','Notes','Title', 'H1')))
+            cell.alignment = Alignment(vertical='top', wrap_text=(headers[cidx - 1] in ('Existing anchor','Evidence / existing sentence','Exact placement','QA Flags','Reason','Notes','Title', 'H1')))
             if ridx % 2 == 0:
                 cell.fill = PatternFill('solid', fgColor='F4F7F9')
             if headers[cidx - 1].endswith('URL') or headers[cidx - 1] == 'URL':
@@ -96,7 +98,7 @@ def create_report(pages_df: pd.DataFrame, suggested_df: pd.DataFrame, warnings: 
     summary.merge_cells('A12:F12')
     summary['A12'] = 'Each link requires manual relevance review. No links have been added to any website.'
     summary.merge_cells('A13:F13')
-    summary['A13'] = 'When using CSV without Existing Links, duplicate-link detection is limited.'
+    summary['A13'] = 'Incoming link counts are observed only among pages in this audit; zero does not prove an orphan page.'
     for row in (11,12,13):
         summary[f'A{row}'].alignment = Alignment(wrap_text=True)
         summary[f'A{row}'].font = Font(size=10, color=GRAY)
@@ -113,19 +115,58 @@ def create_report(pages_df: pd.DataFrame, suggested_df: pd.DataFrame, warnings: 
         'Source URL': 48, 'Source Title': 31, 'Existing anchor': 25,
         'Target URL': 48, 'Target Title': 31, 'Priority': 13,
         'Relevance Score': 16, 'Evidence / existing sentence': 65,
+        'Exact placement': 62, 'QA Flags': 52,
         'Reason': 55, 'Review Status': 17, 'Owner': 18, 'Notes': 38,
     })
-    add_tab(wb, 'Pages Audited', pages_df, {'URL': 55, 'Title': 38, 'H1': 35, 'Source': 20})
+    add_tab(wb, 'Pages Audited', pages_df, {'URL': 55, 'Title': 38, 'H1': 35, 'Source': 20, 'Content review': 39,
+                                           'Link graph status': 41, 'Canonical': 48})
+    graph_cols = ['URL','Incoming links in audited pages','Existing outgoing links',
+                  'Link graph status','Content review']
+    add_tab(wb, 'Observed Link Graph', pages_df[graph_cols],
+            {'URL': 57,'Incoming links in audited pages': 24,
+             'Existing outgoing links': 25,'Link graph status': 45,'Content review': 42})
     guidance = pd.DataFrame([
         {'Step': '1', 'Instruction': 'Filter Suggestions by Source URL. Compare suggested anchors to live body content.'},
         {'Step': '2', 'Instruction': 'Check that each destination genuinely answers the current paragraph intent.'},
-        {'Step': '3', 'Instruction': 'Reject generic, repetitive, ambiguous, or otherwise unnatural links.'},
+        {'Step': '3', 'Instruction': 'Reject generic, repetitive, ambiguous, testimonial, contact, or other unnatural placements.'},
         {'Step': '4', 'Instruction': 'Check duplicate links live, especially when CSV input lacked Existing Links.'},
         {'Step': '5', 'Instruction': 'Apply only approved links in the CMS; re-crawl to verify the change.'},
-        {'Step': '6', 'Instruction': 'Never treat a score as a prediction of ranking gain or guaranteed SEO impact.'},
+        {'Step': '6', 'Instruction': 'A zero incoming-link count is only within this audited set, never a proven sitewide orphan.'},
+        {'Step': '7', 'Instruction': 'Never treat a score as a prediction of ranking gain or guaranteed SEO impact.'},
     ])
     add_tab(wb, 'Review Guide', guidance, {'Step': 12, 'Instruction': 115})
     wb.calculation = CalcProperties(calcMode='auto', fullCalcOnLoad=True)
     output = io.BytesIO()
     wb.save(output)
-    return output.getvalue()
+    # Populate cached values alongside the Excel formulas so preview apps show
+    # correct counts before a desktop spreadsheet engine recalculates them.
+    return _with_cached_overview(output.getvalue(), {
+        'B6': len(pages_df),
+        'B7': len(suggested_df),
+        'B8': int((suggested_df['Priority'] == 'High').sum()) if 'Priority' in suggested_df else 0,
+    })
+
+
+def _with_cached_overview(workbook: bytes, values: dict[str, int]) -> bytes:
+    """Store valid Excel formula caches in Overview without a paid calc engine."""
+    namespace = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+    ET.register_namespace('', namespace)
+    ET.register_namespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships')
+    src = io.BytesIO(workbook)
+    dst = io.BytesIO()
+    with ZipFile(src, 'r') as old, ZipFile(dst, 'w') as new:
+        for info in old.infolist():
+            data = old.read(info.filename)
+            if info.filename == 'xl/worksheets/sheet1.xml':
+                root = ET.fromstring(data)
+                for cell in root.iter(f'{{{namespace}}}c'):
+                    address = cell.get('r', '')
+                    if address not in values:
+                        continue
+                    val = cell.find(f'{{{namespace}}}v')
+                    if val is None:
+                        val = ET.SubElement(cell, f'{{{namespace}}}v')
+                    val.text = str(values[address])
+                data = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+            new.writestr(info, data)
+    return dst.getvalue()

@@ -1,4 +1,4 @@
-"""LinkScope V1: bounded, robots-aware crawling and evidence-based link suggestions.
+"""LinkScope V2: conservative, evidence-based internal link recommendations.
 
 Only existing, unlinked text nodes in paragraph/list content can become anchors.
 This project does not edit or publish client websites.
@@ -33,8 +33,20 @@ MAX_LINKS_PER_SOURCE = 5
 
 STOPWORDS = set('''a an the and or but for to of on at by from in into with without as is are was were be been being this that these those how what why where when who whose which your our their its it they them we us i me you my do does did can could should would will may might about through using use guide guides basics overview complete best top tips things important helpful more learn everything all new key step steps page pages services service firm firms office attorney attorneys lawyer lawyers law legal near local information protect protection need needs right get getting work working what means explained understanding'''.split())
 STOPWORDS.update({'northstar','example','services','llc','inc'})
+SKIP_SOURCE_PATHS = ('/contact', '/testimonials', '/attorney-referral', '/referral', '/reviews/', '/thank-you', '/privacy', '/terms', '/disclaimer', '/cookie', '/case-results/')
 SKIP_TARGET_PATHS = ('/privacy', '/terms', '/disclaimer', '/cookie', '/search', '/tag/', '/author/', '/category/', '/feed', '/wp-admin', '/contact', '/about', '/sitemap')
-EXCLUDE_TAGS = ['script', 'style', 'noscript', 'nav', 'footer', 'header', 'aside', 'form', 'button', 'svg', 'iframe', 'template']
+EXCLUDE_TAGS = ['script', 'style', 'noscript', 'nav', 'footer', 'header', 'aside', 'form', 'button', 'svg', 'iframe', 'template', 'blockquote']
+EXCLUDE_SELECTORS = [
+    '.testimonial', '.testimonials', '[class*=\"testimonial\"]',
+    '.review', '[class*=\"review-card\"]', '.elementor-testimonial',
+    '.comments', '#comments', '.comment-list', '.breadcrumb', '.breadcrumbs',
+    '.related-posts', '.related-articles', '.author-box', '.social-share',
+    '.share-buttons', '.newsletter', '.sidebar', '.popup', '.modal',
+    '.elementor-widget-form', '.elementor-widget-button',
+    '.elementor-widget-icon-list', '.wp-block-latest-posts',
+    '.post-navigation', '.table-of-contents', '.toc', '.cta', '.cta-section',
+]
+
 REQUIRED_FIELDS = ('URL', 'Content')
 
 
@@ -55,6 +67,7 @@ class Page:
     noindex: bool = False
     canonical: str = ''
     source: str = 'CSV'
+    outlinks_known: bool = True
 
 
 def clean_space(value: str) -> str:
@@ -205,37 +218,24 @@ class RobotsGuard:
         return min(10.0, float(delay))
 
 
-def parse_html(url: str, raw_html: bytes, source: str = 'Crawl') -> Page:
-    soup = BeautifulSoup(raw_html, 'html.parser')
-    title = clean_space(soup.title.get_text(' ', strip=True)) if soup.title else ''
-    h1_node = soup.find('h1')
-    h1 = clean_space(h1_node.get_text(' ', strip=True)) if h1_node else ''
-    robots_meta = soup.find('meta', attrs={'name': re.compile(r'^robots$', re.I)})
-    noindex = bool(robots_meta and 'noindex' in (robots_meta.get('content') or '').lower())
-    canonical_node = soup.find('link', attrs={'rel': lambda r: r and 'canonical' in str(r).lower()})
-    canonical = urljoin(url, canonical_node.get('href', '')) if canonical_node else ''
-    # Record the entire document's links to suppress already-linked destinations.
-    existing_links = set()
-    for anchor in soup.select('a[href]'):
-        try:
-            existing_links.add(normalize_url(urljoin(url, anchor['href'])))
-        except (AuditInputError, ValueError):
-            continue
-    scope = (soup.find('main') or soup.find('article') or soup.select_one('[role="main"]')
-             or soup.select_one('.entry-content') or soup.select_one('.post-content')
-             or soup.select_one('.site-main') or soup.body or soup)
-    # Work on a cloned fragment: no mutation of the link inventory above.
-    scope = BeautifulSoup(str(scope), 'html.parser')
-    for tag in scope.find_all(EXCLUDE_TAGS):
+def _extract_blocks(scope: BeautifulSoup) -> tuple[list[str], list[tuple[str, str]]]:
+    """Read editable editorial copy and preserve exact unlinked text-node evidence."""
+    for tag in list(scope.find_all(EXCLUDE_TAGS)):
         tag.decompose()
+    for selector in EXCLUDE_SELECTORS:
+        for item in list(scope.select(selector)):
+            item.decompose()
     paragraphs: list[str] = []
     nodes: list[tuple[str, str]] = []
-    seen_paragraphs = set()
-    for block in scope.select('p, li'):
-        paragraph = clean_space(block.get_text(' ', strip=True))
-        if len(paragraph) < 30 or paragraph in seen_paragraphs:
+    seen: set[str] = set()
+    for block in scope.select('p, li, div'):
+        # Div fallback supports visual builders that render paragraphs as text-only divs.
+        if block.name == 'div' and block.find(['p', 'li', 'div']):
             continue
-        seen_paragraphs.add(paragraph)
+        paragraph = clean_space(block.get_text(' ', strip=True))
+        if len(paragraph) < 32 or paragraph in seen or len(paragraph) > 2200:
+            continue
+        seen.add(paragraph)
         paragraphs.append(paragraph)
         for node in block.find_all(string=True):
             if not isinstance(node, NavigableString) or not node.parent:
@@ -245,9 +245,61 @@ def parse_html(url: str, raw_html: bytes, source: str = 'Crawl') -> Page:
             plain = clean_space(str(node))
             if len(plain) >= 8:
                 nodes.append((plain, paragraph))
+        if len(paragraphs) >= 350:
+            break
+    return paragraphs, nodes
+
+
+def parse_html(url: str, raw_html: bytes, source: str = 'Crawl') -> Page:
+    soup = BeautifulSoup(raw_html, 'html.parser')
+    title = clean_space(soup.title.get_text(' ', strip=True)) if soup.title else ''
+    h1_node = soup.find('h1')
+    h1 = clean_space(h1_node.get_text(' ', strip=True)) if h1_node else ''
+    robots_meta = soup.find('meta', attrs={'name': re.compile(r'^robots$', re.I)})
+    noindex = bool(robots_meta and 'noindex' in (robots_meta.get('content') or '').lower())
+    canonical_node = soup.find('link', attrs={'rel': lambda r: r and 'canonical' in str(r).lower()})
+    canonical = urljoin(url, canonical_node.get('href', '')) if canonical_node else ''
+    existing_links: set[str] = set()
+    for anchor in soup.select('a[href]'):
+        try:
+            existing_links.add(normalize_url(urljoin(url, anchor['href'])))
+        except (AuditInputError, ValueError):
+            continue
+
+    # Content-builder friendly extraction: prefer article bodies, while checking
+    # larger candidates when the selected template only exposes an excerpt.
+    selectors = (
+        '[itemprop=articleBody]', '.elementor-widget-theme-post-content',
+        'article .entry-content', '.entry-content', 'article .post-content',
+        '.post-content', '.elementor-location-single', 'main article',
+        'article', 'main', '[role=main]', '.site-main', 'body',
+    )
+    examined: set[int] = set()
+    best: tuple[float, list[str], list[tuple[str, str]]] = (-1.0, [], [])
+    for priority, selector in enumerate(selectors):
+        for candidate in soup.select(selector)[:3]:
+            if id(candidate) in examined:
+                continue
+            examined.add(id(candidate))
+            scope = BeautifulSoup(str(candidate), 'html.parser')
+            paragraphs, nodes = _extract_blocks(scope)
+            word_count = sum(len(p.split()) for p in paragraphs)
+            if not nodes:
+                continue
+            specificity_bonus = max(0, 11 - priority) * 2.0
+            score = word_count + specificity_bonus
+            if score > best[0]:
+                best = (score, paragraphs, nodes)
+            if word_count >= 180 and priority <= 3:
+                # Dedicated article-body container with substantial editorial copy.
+                break
+        if best[0] > 230 and priority <= 3:
+            break
+    paragraphs, nodes = best[1], best[2]
     return Page(url=normalize_url(url), title=title or h1 or url, h1=h1,
                 content=' '.join(paragraphs), paragraphs=paragraphs, unlinked_nodes=nodes,
-                existing_links=existing_links, noindex=noindex, canonical=canonical, source=source)
+                existing_links=existing_links, noindex=noindex,
+                canonical=canonical, source=source, outlinks_known=True)
 
 
 def read_csv_pages(content: bytes) -> tuple[list[Page], list[str]]:
@@ -302,7 +354,8 @@ def read_csv_pages(content: bytes) -> tuple[list[Page], list[str]]:
             page = Page(url=url, title=take(row, 'Title', 'Title 1', 'Page Title') or url,
                         h1=take(row, 'H1', 'H1-1'), content=' '.join(blocks), paragraphs=blocks,
                         unlinked_nodes=[(b, b) for b in blocks if len(b) >= 12],
-                        focus_keywords=take(row, 'Focus Keywords', 'Target Keywords'), source='CSV Text')
+                        focus_keywords=take(row, 'Focus Keywords', 'Target Keywords'), source='CSV Text',
+                        outlinks_known=has_links)
         else:
             no_text += 1
             continue
@@ -322,7 +375,7 @@ def read_csv_pages(content: bytes) -> tuple[list[Page], list[str]]:
     if dupes:
         warnings.append(f'Ignored {dupes} duplicate URLs.')
     if not has_links:
-        warnings.append('This CSV has no Existing Links column. Existing-link checks are incomplete; verify each suggested target on the live page.')
+        warnings.append('This CSV has no Existing Links column. Existing-link checks and link graph status are incomplete; verify each target on the live page.')
     if len(pages) < 2:
         raise AuditInputError('Need at least two valid URL rows with Content or HTML to recommend internal links.')
     return pages[:MAX_PAGE_COUNT], warnings
@@ -461,9 +514,26 @@ def clean_heading(raw: str) -> str:
     return clean_space(raw)
 
 
+def is_source_eligible(page: Page) -> bool:
+    path = urlsplit(page.url).path.lower()
+    return not page.noindex and not any(segment in path for segment in SKIP_SOURCE_PATHS)
+
+
+def content_review(page: Page) -> str:
+    words = len(page.content.split())
+    if words < 55:
+        return 'Short extracted copy - verify complete article'
+    if words < 130:
+        return 'Limited extracted copy - manual review'
+    return 'Substantial extracted copy'
+
+
 def is_target(page: Page) -> bool:
     path = urlsplit(page.url).path.lower()
     if path in ('/', '') or any(p in path for p in SKIP_TARGET_PATHS) or page.noindex:
+        return False
+    if any(re.search(r'(?:^|-)(?:sample|demo|staging|draft)(?:-|$)', part)
+           or part.startswith('test-') for part in path.strip('/').split('/')):
         return False
     if page.canonical:
         try:
@@ -471,6 +541,10 @@ def is_target(page: Page) -> bool:
                 return False
         except AuditInputError:
             return False
+    # Live crawl frequently picks up 20-30 word blog-card excerpts. Those aren't
+    # sufficient evidence that a destination serves the anchor's reader intent.
+    if page.source == 'Crawl' and len(page.content.split()) < 55:
+        return False
     return True
 
 
@@ -514,58 +588,136 @@ def find_matches(text_node: str, context: str, candidates: dict[str, float]):
     return matches
 
 
+def target_is_hub(target: Page) -> bool:
+    path = urlsplit(target.url).path.lower().strip('/')
+    parts = path.split('/')
+    if any(p in ('service', 'services', 'services_list', 'practice-area', 'practice-areas') for p in parts):
+        return True
+    core = {'personal-injury', 'car-accident', 'car-accidents', 'truck-accidents',
+            'dog-bites', 'dog-bite', 'slip-and-fall', 'estate-planning', 'probate'}
+    return bool(path in core or (parts and parts[-1] in core))
+
+
+def specificity_gap(anchor: str, context: str, target: Page) -> tuple[float, str]:
+    """Penalize broad terms linking to unrelated, much narrower articles."""
+    anchor_tokens = set(tokens(anchor))
+    target_terms = set(tokens(clean_heading(target.h1 or target.title)))
+    context_terms = set(tokens(context))
+    missing = target_terms - anchor_tokens
+    if not missing or target_is_hub(target):
+        return 0.0, ''
+    overlap = missing & context_terms
+    generic = len(anchor_tokens) <= 2 or anchor.lower().strip() in {
+        'a car accident', 'slip and fall', 'personal injury', 'accident in california', 'dog bite',
+    }
+    if generic and not overlap and len(missing) >= 1:
+        return 2.6, 'Broad anchor; specific destination topic missing from sentence.'
+    if not overlap and len(missing) >= 2:
+        return 1.35, 'Check narrow destination topic against surrounding content.'
+    return 0.0, ''
+
+
+def placement_markup(anchor: str, context: str) -> str:
+    match = re.search(re.escape(anchor), context, flags=re.I)
+    if not match:
+        return context[:320]
+    start = max(0, match.start()-90)
+    end = min(len(context), match.end()+130)
+    return ('...' if start else '') + context[start:match.start()] + '[' + context[match.start():match.end()] + ']' + context[match.end():end] + ('...' if end < len(context) else '')
+
+
 def suggest_links(pages: list[Page], max_per_source: int = 3, min_score: float = 5.5) -> pd.DataFrame:
     max_per_source = max(1, min(MAX_LINKS_PER_SOURCE, int(max_per_source)))
-    candidates = {p.url: phrases_from_target(p) for p in pages if is_target(p)}
-    results = []
+    targets = {p.url: phrases_from_target(p) for p in pages if is_target(p)}
+    rows: list[dict] = []
     for source in pages:
+        if not is_source_eligible(source) or not source.unlinked_nodes:
+            continue
         possible = []
+        source_text_lower = source.content.lower()
         for target in pages:
-            if target.url == source.url or target.url in source.existing_links or target.url not in candidates:
+            if target.url == source.url or target.url in source.existing_links or target.url not in targets:
                 continue
-            # Fast pre-filter before inspecting individual eligible text nodes.
-            source_text_lower = source.content.lower()
-            if not any(phrase in source_text_lower for phrase in candidates[target.url]):
+            phrases = targets[target.url]
+            if not any(phrase in source_text_lower for phrase in phrases):
                 continue
-            score_similarity = similarity(source, target)
+            similarity_score = similarity(source, target)
             best = None
             for node_text, context in source.unlinked_nodes:
-                for anchor, weight, sentence in find_matches(node_text, context, candidates[target.url]):
-                    # An anchor is guaranteed to occur in one source text node that is not inside an existing <a>.
+                for anchor, weight, sentence in find_matches(node_text, context, phrases):
                     if len(anchor.strip()) > 75:
                         continue
-                    score = weight + 4.5 * score_similarity + min(0.5, len(anchor.split()) * 0.1)
+                    penalty, note = specificity_gap(anchor, sentence, target)
+                    score = (weight + 4.5*similarity_score
+                             + min(0.5, len(anchor.split()) * 0.1) - penalty)
                     if score < min_score:
                         continue
                     if best is None or score > best[0]:
-                        best = (score, anchor, sentence)
+                        best = (score, anchor, sentence, note)
             if best:
-                score, anchor, sentence = best
-                confidence = 'High' if score >= 9.1 and score_similarity >= 0.24 else 'Medium'
+                score, anchor, sentence, note = best
+                confidence = 'High' if score >= 9.1 and similarity_score >= 0.24 and not note else 'Medium'
                 possible.append({
                     'Source URL': source.url, 'Source Title': source.title,
                     'Existing anchor': anchor, 'Target URL': target.url,
                     'Target Title': target.title, 'Priority': confidence,
                     'Relevance Score': round(score, 2),
                     'Evidence / existing sentence': sentence[:550],
-                    'Reason': 'Target topic appears verbatim in unlinked copy; verify the destination answers the reader intent.',
+                    'Exact placement': placement_markup(anchor, sentence)[:420],
+                    'QA Flags': note or ('Target copy is limited; check the destination live.' if len(target.content.split()) < 130 else ''),
+                    'Reason': 'Phrase occurs in an unlinked text node; review context and destination intent.',
                     'Review Status': 'Needs review', 'Owner': '', 'Notes': '',
                 })
-        possible.sort(key=lambda r: (-r['Relevance Score'], r['Target URL']))
-        results.extend(possible[:max_per_source])
-    results.sort(key=lambda r: (-r['Relevance Score'], r['Source URL'], r['Target URL']))
-    columns = ['Source URL', 'Source Title', 'Existing anchor', 'Target URL', 'Target Title', 'Priority',
-               'Relevance Score', 'Evidence / existing sentence', 'Reason', 'Review Status', 'Owner', 'Notes']
-    return pd.DataFrame(results, columns=columns)
+        # One destination per anchor and one new link per sentence/context. Never
+        # place multiple competing destinations on the same repeated phrase.
+        possible.sort(key=lambda item: (-item['Relevance Score'], -len(item['Existing anchor']), item['Target URL']))
+        used_anchors: set[str] = set()
+        used_sentences: set[str] = set()
+        count = 0
+        for rec in possible:
+            anchor_key = rec['Existing anchor'].casefold().strip()
+            sentence_key = rec['Evidence / existing sentence'].casefold().strip()
+            if anchor_key in used_anchors or sentence_key in used_sentences:
+                continue
+            used_anchors.add(anchor_key)
+            used_sentences.add(sentence_key)
+            rows.append(rec)
+            count += 1
+            if count >= max_per_source:
+                break
+    rows.sort(key=lambda item: (-item['Relevance Score'], item['Source URL'], item['Target URL']))
+    columns = ['Source URL','Source Title','Existing anchor','Target URL','Target Title',
+               'Priority','Relevance Score','Evidence / existing sentence','Exact placement',
+               'QA Flags','Reason','Review Status','Owner','Notes']
+    return pd.DataFrame(rows, columns=columns)
 
 
 def pages_table(pages: Iterable[Page]) -> pd.DataFrame:
+    seq = list(pages)
+    indexed = {page.url for page in seq}
+    coverage = all(page.outlinks_known for page in seq)
+    inbound: Counter = Counter()
+    for page in seq:
+        if page.outlinks_known:
+            for link in page.existing_links:
+                if link in indexed and link != page.url:
+                    inbound[link] += 1
     data = []
-    for page in pages:
-        data.append({'URL': page.url, 'Title': page.title, 'H1': page.h1,
-                     'Words in extracted copy': len(page.content.split()),
-                     'Existing outgoing links': len(page.existing_links),
-                     'Eligible unlinked text nodes': len(page.unlinked_nodes),
-                     'Noindex': 'Yes' if page.noindex else 'No',
-                     'Source': page.source})
+    for page in seq:
+        count = inbound[page.url]
+        graph_status = ('Unknown: incomplete link inventory' if not coverage
+                        else ('No incoming link observed in sample' if count == 0
+                              else 'Incoming link observed in sample'))
+        data.append({
+            'URL': page.url, 'Title': page.title, 'H1': page.h1,
+            'Words in extracted copy': len(page.content.split()),
+            'Content review': content_review(page),
+            'Existing outgoing links': len(page.existing_links),
+            'Incoming links in audited pages': count if coverage else None,
+            'Link graph status': graph_status,
+            'Eligible unlinked text nodes': len(page.unlinked_nodes),
+            'Noindex': 'Yes' if page.noindex else 'No',
+            'Canonical': page.canonical,
+            'Source': page.source,
+        })
     return pd.DataFrame(data)
