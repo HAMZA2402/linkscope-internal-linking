@@ -1,0 +1,18 @@
+LINKSCOPE V1 - INTERNAL LINKING AUTOMATION
+
+1. Download and unzip this package.
+2. Create a NEW GitHub repository: linkscope-internal-linking
+3. Upload the INDIVIDUAL files from this extracted folder, not the ZIP.
+   Keep app.py, internal_link_engine.py, reporting.py,
+   requirements.txt and fictional_demo_pages.csv at the root.
+4. Open https://share.streamlit.io/ and create a second Streamlit app:
+   Repository: YOUR-USERNAME/linkscope-internal-linking
+   Branch: main
+   Main file: app.py
+5. Once it is live, choose Fictional demo > Analyze fictional example.
+6. Download the Excel audit under Downloads & method.
+
+DO NOT upload confidential client data without permission.
+For live website crawling, configure CRAWL_ACCESS_KEY in Streamlit
+Manage app > Settings > Secrets. See README.md for details.
+This is a separate app from your SEO Intelligence Platform V4.
