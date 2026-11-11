@@ -100,7 +100,7 @@ else:
         delay = b.slider('Minimum delay between requests (seconds)', 0.3, 3.0, 0.8, 0.1)
         entered_secret = st.text_input('Private crawl access key', type='password', help='Configured by the app owner in Streamlit Secrets; never commit it to GitHub.')
         allowed = st.checkbox('I am authorized to audit this public website and understand robots.txt will be respected.')
-        run_requested = st.form_submit_button('Start bounded crawl', type='primary', disabled=not allowed or not owner_secret)
+        run_requested = st.form_submit_button('Start bounded crawl', type='primary', disabled=not owner_secret)
     if run_requested and allowed:
         if not owner_secret or entered_secret != owner_secret:
             st.error('Incorrect crawl access key. Live crawling is available to authorized owners only.')
